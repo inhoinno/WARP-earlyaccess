@@ -3,8 +3,10 @@
 // #define FEMU_DEBUG_FTL
 #define FEMU_FDP_LATENCY_DISABLE 0
 #ifdef FEMU_DEBUG_FTL
-
 #endif
+
+#define RUH_ID_SMALL_RU_ENABLED 0
+
 static void *ftl_thread(void *arg);
 static inline bool _should_gc_fdp_style(struct ssd *ssd, uint16_t rgidx)
 {
@@ -430,6 +432,149 @@ static int check_ruh_gc_entry(struct ssd *ssd, FemuReclaimUnit *ru)
     }
 }
 
+static FemuReclaimUnit *fdp_small_ru_pointer(struct ssd *ssd, FemuReclaimGroup *rg, FemuRuHandle *ruh, FemuReclaimUnit *ru)
+{
+    struct ssdparams *spp = &ssd->sp;
+    struct ru_mgmt *rm = rg->ru_mgmt;
+    struct write_pointer *wpp = ru->ssd_wptr;
+    FemuReclaimUnit *curr_ru = ru; // rg idx 0
+    FemuReclaimUnit *new_ru = NULL;
+    bool isFull = true;
+    //ftl_debug("             check_addr(wpp->ch, spp->nchs); \n");
+    check_addr(wpp->ch, spp->nchs);
+    //ftl_debug("             INSIDE %s \n",__func__);
+    //wpp->ch++;
+    //original : ch->way(lun)->plane(single plane, skip)->block(pgs_per_blk)
+    //change : plane(single plane, skip)->block(pgs_per_blk)->ch->way(lun) 
+    
+    /* go to next page in the block */
+    wpp->pg++;
+    if (wpp->pg == spp->pgs_per_blk)
+    {
+        wpp->pg = 0;
+        check_addr(wpp->ch, spp->nchs);
+        /* go to next channel */
+        wpp->ch++; 
+        if (wpp->ch == spp->nchs)
+        {
+            wpp->ch = 0;
+            check_addr(wpp->lun, spp->luns_per_ch);
+             /* go to next lun */
+            wpp->lun++;
+            if (wpp->lun == spp->luns_per_ch)
+            {
+                wpp->lun = 0;
+                /* block fin, channel fin, way fin. */
+                if (ru->next_line_index == ru->n_lines){ //TODO: Single SB for RU for now
+                    for (int i = 0; i < ru->n_lines; ++i)
+                    {
+                        /* move current line to {victim,full} line list */
+                        struct line *line = ru->lines[i];
+                        if (line->vpc != spp->pgs_per_line)
+                        {
+                            ftl_assert(line->vpc >= 0 && line->vpc < spp->pgs_per_line);
+                            /* update corresponding ru status */
+                            //ru->vpc += line->vpc;
+                            if(ru->vpc != line->vpc && spp->lines_per_ru == 1){
+                                ru->vpc = line->vpc ;
+                            }
+                            isFull = false;
+                        }else {
+                            ru->vpc = line->vpc ;
+                        }
+                    }
+
+                    if (isFull)
+                    {
+                        /* all pgs are still valid, move to full line list */
+                        ftl_assert(wpp->curline->ipc == 0);
+                        QTAILQ_INSERT_TAIL(&rm->full_ru_list, curr_ru, entry);
+                        rm->full_ru_cnt++;
+                        ftl_debug(" curr_ru %d %p  isFull rm->full_ru_cnt %d \n",curr_ru->ruidx, curr_ru ,rm->full_ru_cnt);
+                    }
+                    else
+                    {
+                        for (int i = 0; i < ru->n_lines; ++i)
+                        {
+                            struct line *line = ru->lines[i];
+                            ftl_assert((spp->pgs_per_line - (line->vpc + line->ipc)) == 0); // Victim ru have either valid or invalid pages only. Not free pages.
+                        }
+                        ftl_debug("   %s - RUH %d victim ru id %d , %p \n", __func__ , curr_ru->ruh->ruhid , curr_ru->ruidx, curr_ru);
+                        
+                        if (rm->mgmt_type == GC_GLOBAL_CB){
+                            ru->utilization = (float) ru->vpc / ru->npages;
+                            ru->my_cb = CACL_COST_BENEFIT_APPROX(ru->utilization, ru->last_invalidated_time) ;
+                            pqueue_insert(rm->victim_ru_cb, curr_ru);
+
+                        }else{
+                            pqueue_insert(rm->victim_ru_pq, curr_ru);
+                            if ( check_ruh_gc_entry(ssd, curr_ru) ){
+                                rm = curr_ru->ruh->ru_mgmt;
+                                ftl_assert(rm!=NULL);
+                                pqueue_insert(rm->victim_ru_pq, curr_ru);
+                            }
+                        }
+                        rm->victim_ru_cnt++;
+                    }
+                    if (ruh != NULL)
+                    {
+                        /* current RU is used up, pick another empty RU */
+                        check_addr(wpp->blk, spp->blks_per_pl);
+                        if((new_ru = fdp_get_new_ru(ssd, ru->rgidx, ruh->ruhid)) == NULL){
+                            ftl_err("No free space left in device. \n");
+                            ftl_assert(false && __LINE__ );
+                        }
+                        //ruh->curr_ru = new_ru; 
+                        //ruh->rus[rg->rgidx] = new_ru;
+                        //ruh->ruh->rus[rg->rgidx] = new_ru->nvme_ru;
+                        //ftl_assert(ruh->curr_ru == new_ru);
+                        //ftl_assert(new_ru->ruh == ruh);
+                        //ftl_assert(ruh->ruh->rus[rg->rgidx] == new_ru->nvme_ru);    
+                        wpp = new_ru->ssd_wptr;
+                        ftl_debug("ruh %d - call new ru ( new_ru %d line id %d %p curr_ru %d ru_in_use_cnt %u )  \n", ruh->ruhid, new_ru->ruidx, new_ru->lines[0]->id, new_ru, curr_ru->ruidx, ruh->ru_in_use_cnt);
+                        // Assume fdp get new ru make ru->lines have free lines
+                        if (wpp == NULL)
+                        {
+                            ftl_err(" wpp==NULL How can wpp be NULL?\n");
+                            abort();
+                        }
+                        wpp->blk = wpp->curline->id;
+                        check_addr(wpp->blk, spp->blks_per_pl);
+                        /* make sure we are starting from page 0 in the super block */
+                        ftl_assert(wpp->pg == 0);
+                        ftl_assert(wpp->lun == 0);
+                        ftl_assert(wpp->ch == 0);
+                        /* TODO: assume # of pl_per_lun is 1, fix later */
+                        ftl_assert(wpp->pl == 0);
+                        ftl_assert(ru->ruh == ruh);
+
+                    }else
+                    {
+                        // ftl_err("ru->lines %p  \n", ru->lines);
+                        ftl_assert(false); //fallout
+                        fdp_inc_ru_write_pointer(ssd, ru);
+                    }
+                }//multi lines
+                else
+                {
+                    // ftl_err("ru->lines %p  \n", ru->lines);
+                    //Put error
+                    ftl_assert(false); //fallout
+                    fdp_inc_ru_write_pointer(ssd, ru);
+                }
+            }//lun
+        }//ch 
+    }//block
+    
+    if (new_ru != NULL)
+    {
+        //ftl_debug("           RET  new_ru %p (rg%d ruh%d : ruamw : %lu) ruh->curr_ru %p \n", new_ru, new_ru->rgidx, new_ru->ruh->ruhid, new_ru->ru->ruamw, ruh->curr_ru);
+        return new_ru;
+    }
+    //ftl_debug("         RET  %s curr_ru(ruamw : %lu) \n", __func__ ,curr_ru->ru->ruamw);
+    return curr_ru;
+}
+
 static FemuReclaimUnit *fdp_advance_ru_pointer(struct ssd *ssd, FemuReclaimGroup *rg, FemuRuHandle *ruh, FemuReclaimUnit *ru)
 {
     struct ssdparams *spp = &ssd->sp;
@@ -440,7 +585,7 @@ static FemuReclaimUnit *fdp_advance_ru_pointer(struct ssd *ssd, FemuReclaimGroup
     bool isFull = true;
     //ftl_debug("             check_addr(wpp->ch, spp->nchs); \n");
     check_addr(wpp->ch, spp->nchs);
-    //ftl_debug("             INSIDE fdp_advance_ru_pointer \n");
+    //ftl_debug("             INSIDE %s\n",__func__);
     wpp->ch++;
     if (wpp->ch == spp->nchs)
     {
@@ -501,7 +646,7 @@ static FemuReclaimUnit *fdp_advance_ru_pointer(struct ssd *ssd, FemuReclaimGroup
                             //fdp_log("       victim ru insert curr_ru->line[%d] id %d vpc %d ipc %d free pg %d\n", i, line->id, line->vpc, line->ipc, (spp->pgs_per_line - (line->vpc + line->ipc)));
                             ftl_assert((spp->pgs_per_line - (line->vpc + line->ipc)) == 0); // Victim ru have either valid or invalid pages only. Not free pages.
                         }
-                        ftl_debug("   fdp_advance_ru_pointer - RUH %d victim ru id %d , %p \n",curr_ru->ruh->ruhid , curr_ru->ruidx, curr_ru);
+                        ftl_debug("   %s - RUH %d victim ru id %d , %p \n", __func__ ,curr_ru->ruh->ruhid , curr_ru->ruidx, curr_ru);
                         
                         if (rm->mgmt_type == GC_GLOBAL_CB){
                             ru->utilization = (float) ru->vpc / ru->npages;
@@ -575,126 +720,12 @@ static FemuReclaimUnit *fdp_advance_ru_pointer(struct ssd *ssd, FemuReclaimGroup
 
     if (new_ru != NULL)
     {
-        //ftl_debug("           RET fdp_advance_ru_pointer new_ru %p (rg%d ruh%d : ruamw : %lu) ruh->curr_ru %p \n", new_ru, new_ru->rgidx, new_ru->ruh->ruhid, new_ru->ru->ruamw, ruh->curr_ru);
+        //ftl_debug("           RET %s new_ru %p (rg%d ruh%d : ruamw : %lu) ruh->curr_ru %p \n", __func__, new_ru, new_ru->rgidx, new_ru->ruh->ruhid, new_ru->ru->ruamw, ruh->curr_ru);
         return new_ru;
     }
-    //ftl_debug("         RET fdp_advance_ru_pointer curr_ru(ruamw : %lu) \n",curr_ru->ru->ruamw);
+    //ftl_debug("         RET %s curr_ru(ruamw : %lu) \n",__func__,curr_ru->ru->ruamw);
     return curr_ru;
 }
-
-// static FemuReclaimUnit *fdp_advance_ru_pointer_for_gc(struct ssd *ssd, FemuReclaimGroup *rg, FemuRuHandle *ruh, FemuReclaimUnit *ru)
-// {
-//     struct ssdparams *spp = &ssd->sp;
-//     struct ru_mgmt *rm = rg->ru_mgmt;
-//     struct write_pointer *wpp = ru->ssd_wptr;
-//     FemuReclaimUnit *curr_ru = ru; // rg idx 0
-//     FemuReclaimUnit *new_ru = NULL;
-//     bool isFull = true;
-//     check_addr(wpp->ch, spp->nchs);
-//     wpp->ch++;
-//     if (wpp->ch == spp->nchs)
-//     {
-//         wpp->ch = 0;
-//         check_addr(wpp->lun, spp->luns_per_ch);
-//         wpp->lun++;
-//         /* in this case, we should go to next lun */
-//         if (wpp->lun == spp->luns_per_ch)
-//         {
-//             wpp->lun = 0;
-//             /* go to next page in the block */
-//             check_addr(wpp->pg, spp->pgs_per_blk);
-//             wpp->pg++;
-//             if (wpp->pg == spp->pgs_per_blk)
-//             {
-//                 if (ru->next_line_index == ru->n_lines)
-//                 {
-//                     wpp->pg = 0;
-//                     /*Now calling new should be Reclaim Unit, not a line */
-//                     for (int i = 0; i < ru->n_lines; ++i)
-//                     {
-//                         /* move current line to {victim,full} line list */
-//                         struct line *line = ru->lines[i];
-//                         if (line->vpc != spp->pgs_per_line)
-//                         {
-//                             ftl_assert(line->vpc >= 0 && line->vpc < spp->pgs_per_line);
-//                             /* update corresponding ru status */
-//                             if(ru->vpc != line->vpc && spp->lines_per_ru == 1){
-//                                 ru->vpc = line->vpc ;
-//                             }
-//                             isFull = false;
-//                         }else {
-//                             ru->vpc = line->vpc ;
-//                         }
-//                     }          
-//                     if (isFull)
-//                     {
-//                         /* all pgs are still valid, move to full line list */
-//                         ftl_assert(wpp->curline->ipc == 0);
-//                         QTAILQ_INSERT_TAIL(&rm->full_ru_list, curr_ru, entry);
-//                         rm->full_ru_cnt++;
-//                         ftl_debug(" curr_ru %d %p  isFull rm->full_ru_cnt %d \n",curr_ru->ruidx, curr_ru ,rm->full_ru_cnt);
-//                     }
-//                     else
-//                     {
-//                         for (int i = 0; i < ru->n_lines; ++i)
-//                         {
-//                             struct line *line = ru->lines[i];
-//                             //fdp_log("       victim ru insert curr_ru->line[%d] id %d vpc %d ipc %d free pg %d\n", i, line->id, line->vpc, line->ipc, (spp->pgs_per_line - (line->vpc + line->ipc)));
-//                             ftl_assert((spp->pgs_per_line - (line->vpc + line->ipc)) == 0); // Victim ru have either valid or invalid pages only. Not free pages.
-//                         }
-//                         ftl_debug("   fdp_advance_ru_pointer - RUH %d victim ru id %d , %p \n",curr_ru->ruh->ruhid , curr_ru->ruidx, curr_ru);
-//                         pqueue_insert(rm->victim_ru_pq, curr_ru);
-//                         rm->victim_ru_cnt++;
-//                     }
-//                     if (ruh != NULL)
-//                     {
-//                         /* current line is used up, pick another empty line */
-//                         check_addr(wpp->blk, spp->blks_per_pl);
-//                         new_ru = fdp_get_new_ru(ssd, ru->rgidx, ruh->ruhid);
-//                         ruh->gc_ru = new_ru;
-//                         //ruh->curr_ru = new_ru; 
-//                         //ruh->rus[rg->rgidx] = new_ru;
-//                         //ruh->ruh->rus[rg->rgidx] = new_ru->nvme_ru;
-//                         //ftl_assert(ruh->curr_ru == new_ru);
-//                         //ftl_assert(new_ru->ruh == ruh);
-//                         //ftl_assert(ruh->ruh->rus[rg->rgidx] == new_ru->nvme_ru);    
-//                         wpp = new_ru->ssd_wptr;
-//                         ftl_debug("ruh %d - call new ru ( new_ru %d %p curr_ru %d at %p )\n", ruh->ruhid, new_ru->ruidx, new_ru, curr_ru->ruidx, curr_ru);
-//                         // Assume fdp get new ru make ru->lines have free lines
-
-//                         if (wpp == NULL)
-//                         {
-//                             ftl_err(" wpp==NULL How can wpp be NULL?\n");
-//                             abort();
-//                         }
-//                         wpp->blk = wpp->curline->id;
-//                         check_addr(wpp->blk, spp->blks_per_pl);
-//                         /* make sure we are starting from page 0 in the super block */
-//                         ftl_assert(wpp->pg == 0);
-//                         ftl_assert(wpp->lun == 0);
-//                         ftl_assert(wpp->ch == 0);
-//                         /* TODO: assume # of pl_per_lun is 1, fix later */
-//                         ftl_assert(wpp->pl == 0);
-//                         ftl_assert(ru->ruh == ruh);
-
-//                     }
-//                 }
-//                 else
-//                 {
-//                     // ftl_err("ru->lines %p  \n", ru->lines);
-//                     fdp_inc_ru_write_pointer(ssd, ru);
-//                 }
-//             }
-//         }
-//     }
-//     if (new_ru != NULL)
-//     {
-//         //ftl_debug("           RET fdp_advance_ru_pointer new_ru %p (rg%d ruh%d : ruamw : %lu) ruh->curr_ru %p \n", new_ru, new_ru->rgidx, new_ru->ruh->ruhid, new_ru->ru->ruamw, ruh->curr_ru);
-//         return new_ru;
-//     }
-//     //ftl_debug("         RET fdp_advance_ru_pointer curr_ru(ruamw : %lu) \n",curr_ru->ru->ruamw);
-//     return curr_ru;
-// }
 
 #endif
 
@@ -1768,9 +1799,17 @@ static void gc_write_page_fdp_style(struct ssd *ssd, struct ppa *old_ppa, FemuRe
     /* need to advance the write pointer here */
     if(new_ru->ruh->ruh_type == NVME_RUHT_PERSISTENTLY_ISOLATED ){
         //ftl_debug("         NVME_RUHT_PERSISTENTLY_ISOLATED \n");
-        //curr_ru = fdp_advance_ru_pointer(ssd, &ssd->rg[new_ru->rgidx], new_ru->ruh, new_ru);
-        if( (ret_ru = fdp_advance_ru_pointer(ssd, &ssd->rg[new_ru->rgidx], new_ru->ruh, new_ru)) != new_ru->ruh->gc_ru){
-            new_ru->ruh->gc_ru = ret_ru;
+        if (new_ru->ruh->ruhid == RUH_ID_SMALL_RU_ENABLED)
+        {
+            if( (ret_ru = fdp_small_ru_pointer(ssd, &ssd->rg[new_ru->rgidx], new_ru->ruh, new_ru)) != new_ru->ruh->gc_ru){
+                new_ru->ruh->gc_ru = ret_ru;
+            }
+        }
+        else
+        {
+            if( (ret_ru = fdp_advance_ru_pointer(ssd, &ssd->rg[new_ru->rgidx], new_ru->ruh, new_ru)) != new_ru->ruh->gc_ru){
+                new_ru->ruh->gc_ru = ret_ru;
+            }
         }
         //new_ru->ruh->curr_ru = curr_ru;
     }
@@ -1783,12 +1822,20 @@ static void gc_write_page_fdp_style(struct ssd *ssd, struct ppa *old_ppa, FemuRe
             //ftl_debug("         type : Host -> GC id : %p \n", new_ru);
             new_ru->ruh = &ssd->ruhs[gcruh_id];
         }
-        //curr_ru = fdp_advance_ru_pointer(ssd, &ssd->rg[new_ru->rgidx], new_ru->ruh, new_ru);
-        if( (ret_ru = fdp_advance_ru_pointer(ssd, &ssd->rg[new_ru->rgidx], new_ru->ruh, new_ru)) != ssd->ruhs[gcruh_id].curr_ru ) {
-            ssd->ruhs[gcruh_id].rus[new_ru->rgidx] = ret_ru;
-            ssd->ruhs[gcruh_id].curr_ru = ret_ru;
-            ssd->ruhs[gcruh_id].ruh->rus[new_ru->rgidx] = ret_ru->nvme_ru;
-        } 
+
+        if (new_ru->ruh->ruhid == RUH_ID_SMALL_RU_ENABLED)
+        {
+            if( (ret_ru = fdp_small_ru_pointer(ssd, &ssd->rg[new_ru->rgidx], new_ru->ruh, new_ru)) != new_ru->ruh->gc_ru){
+                new_ru->ruh->gc_ru = ret_ru;
+            }
+        }
+        else{
+            if( (ret_ru = fdp_advance_ru_pointer(ssd, &ssd->rg[new_ru->rgidx], new_ru->ruh, new_ru)) != ssd->ruhs[gcruh_id].curr_ru ) {
+                ssd->ruhs[gcruh_id].rus[new_ru->rgidx] = ret_ru;
+                ssd->ruhs[gcruh_id].curr_ru = ret_ru;
+                ssd->ruhs[gcruh_id].ruh->rus[new_ru->rgidx] = ret_ru->nvme_ru;
+            } 
+        }
         //new_ru->ruh->curr_ru = curr_ru;
         //new_ru->ruh->rus[new_ru->rgidx] = curr_ru;
 
@@ -2797,12 +2844,21 @@ static uint64_t ssd_stream_write(FemuCtrl *n, struct ssd *ssd, NvmeRequest *req)
         // fdp_log("       set_maptbl_ent, set_rmap_ent, mark_page_valid fin\n");
 
         /* need to advance the write pointer here */
-        if((ru = fdp_advance_ru_pointer(ssd, rg, ruh, ru)) != ruh->curr_ru ){
-            //fdp_log( " fdp_advance_ru_pointer \n");
-            ftl_debug( "ruh %d wptr update prev_ru %d at %p (nvme_ru %p) curr_ru %d at %p (nvme_ru %p) \n", ruhid, ruh->curr_ru->ruidx, ruh->curr_ru, ruh->curr_ru->nvme_ru, ru->ruidx, ru, ru->nvme_ru);
-            ruh->rus[rgid] = ru;
-            ruh->curr_ru = ru;
-            ruh->ruh->rus[rgid] = ru->nvme_ru;
+        if (ruh->ruhid == RUH_ID_SMALL_RU_ENABLED ){
+            if((ru = fdp_small_ru_pointer(ssd, rg, ruh, ru)) != ruh->curr_ru ){
+                ftl_debug( "ruh %d wptr update prev_ru %d at %p (nvme_ru %p) curr_ru %d at %p (nvme_ru %p) \n", ruhid, ruh->curr_ru->ruidx, ruh->curr_ru, ruh->curr_ru->nvme_ru, ru->ruidx, ru, ru->nvme_ru);
+                ruh->rus[rgid] = ru;
+                ruh->curr_ru = ru;
+                ruh->ruh->rus[rgid] = ru->nvme_ru;
+            }
+        }
+        else {
+            if((ru = fdp_advance_ru_pointer(ssd, rg, ruh, ru)) != ruh->curr_ru ){
+                ftl_debug( "ruh %d wptr update prev_ru %d at %p (nvme_ru %p) curr_ru %d at %p (nvme_ru %p) \n", ruhid, ruh->curr_ru->ruidx, ruh->curr_ru, ruh->curr_ru->nvme_ru, ru->ruidx, ru, ru->nvme_ru);
+                ruh->rus[rgid] = ru;
+                ruh->curr_ru = ru;
+                ruh->ruh->rus[rgid] = ru->nvme_ru;
+            }
         }
         
         ftl_assert(ruh->curr_ru == ru);
