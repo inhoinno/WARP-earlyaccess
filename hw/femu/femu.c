@@ -687,7 +687,7 @@ static bool nvme_subsys_setup_fdp(NvmeSubsystem *subsys, Error **errp)  //settin
             };
         }else{
             endgrp->fdp.ruhs[ruhid] = (NvmeRuHandle) {
-                .ruht = NVME_RUHT_PERSISTENTLY_ISOLATED,
+                .ruht = NVME_RUHT_INITIALLY_ISOLATED,
                 .ruha = NVME_RUHA_UNUSED,
             };
         }
